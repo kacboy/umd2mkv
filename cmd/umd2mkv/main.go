@@ -516,9 +516,24 @@ func makeOMAHeader(c1, c2 byte) []byte {
 	return h
 }
 
-var iso639 = map[string]string{"eng": "English", "fra": "French", "fre": "French", "spa": "Spanish", "deu": "German", "ger": "German", "ita": "Italian", "jpn": "Japanese", "por": "Portuguese", "nld": "Dutch", "dut": "Dutch", "rus": "Russian", "kor": "Korean", "zho": "Chinese", "chi": "Chinese", "ara": "Arabic", "pol": "Polish", "swe": "Swedish", "nor": "Norwegian", "dan": "Danish", "fin": "Finnish", "ces": "Czech", "cze": "Czech", "hun": "Hungarian", "tur": "Turkish"}
+type LanguageInfo struct {
+	Code string
+	Name string
+}
 
-func inspectCLPLanguages(isoPath string, clip *IsoEntry) []string {
+var iso639 = map[string]LanguageInfo{
+	"eng": {"eng", "English"}, "fra": {"fre", "French"}, "fre": {"fre", "French"},
+	"spa": {"spa", "Spanish"}, "deu": {"ger", "German"}, "ger": {"ger", "German"},
+	"ita": {"ita", "Italian"}, "jpn": {"jpn", "Japanese"}, "por": {"por", "Portuguese"},
+	"nld": {"dut", "Dutch"}, "dut": {"dut", "Dutch"}, "rus": {"rus", "Russian"},
+	"kor": {"kor", "Korean"}, "zho": {"chi", "Chinese"}, "chi": {"chi", "Chinese"},
+	"ara": {"ara", "Arabic"}, "pol": {"pol", "Polish"}, "swe": {"swe", "Swedish"},
+	"nor": {"nor", "Norwegian"}, "dan": {"dan", "Danish"}, "fin": {"fin", "Finnish"},
+	"ces": {"cze", "Czech"}, "cze": {"cze", "Czech"}, "hun": {"hun", "Hungarian"},
+	"tur": {"tur", "Turkish"},
+}
+
+func detectCLPLanguages(isoPath string, clip *IsoEntry) []LanguageInfo {
 	if clip == nil {
 		return nil
 	}
@@ -536,22 +551,33 @@ func inspectCLPLanguages(isoPath string, clip *IsoEntry) []string {
 	if err != nil {
 		return nil
 	}
-	var out []string
+	var out []LanguageInfo
 	seen := map[string]bool{}
 	for i := 0; i+3 <= len(b); i++ {
-		s := strings.ToLower(string(b[i : i+3]))
-		if name, ok := iso639[s]; ok && !seen[s] {
-			seen[s] = true
-			out = append(out, s+" ("+name+")")
+		raw := strings.ToLower(string(b[i : i+3]))
+		info, ok := iso639[raw]
+		if !ok || seen[info.Code] {
+			continue
 		}
+		seen[info.Code] = true
+		out = append(out, info)
 	}
 	return out
+}
+
+func languageSummary(langs []LanguageInfo) string {
+	parts := make([]string, 0, len(langs))
+	for _, l := range langs {
+		parts = append(parts, l.Code+" ("+l.Name+")")
+	}
+	return strings.Join(parts, ", ")
 }
 
 func main() {
 	iso := flag.String("iso", "", "path to PSP UMD Video ISO")
 	out := flag.String("out", "", "output MKV path")
 	inspect := flag.Bool("inspect", false, "scan ISO and print selected stream / CLP language-code candidates")
+	audioMode := flag.String("audio", "aac", "audio output: aac (default, AAC-LC 256k) or flac")
 	flag.Parse()
 	if *iso == "" {
 		fmt.Fprintln(os.Stderr, "usage: umd2mkv -iso movie.iso [-out movie.mkv] [-inspect]")
@@ -565,9 +591,9 @@ func main() {
 	logf("Movie: %s (%d bytes)", r.Movie.Path, r.Movie.Size)
 	if r.ClipInfo != nil {
 		logf("Clip info: %s", r.ClipInfo.Path)
-		langs := inspectCLPLanguages(*iso, r.ClipInfo)
+		langs := detectCLPLanguages(*iso, r.ClipInfo)
 		if len(langs) > 0 {
-			logf("CLP language-code candidates: %s", strings.Join(langs, ", "))
+			logf("CLP language-code candidates: %s", languageSummary(langs))
 		} else {
 			logf("CLP language-code candidates: none confidently recognized")
 		}
@@ -600,6 +626,15 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	mode := strings.ToLower(strings.TrimSpace(*audioMode))
+	if mode != "aac" && mode != "flac" {
+		fmt.Fprintln(os.Stderr, "-audio must be aac or flac")
+		os.Exit(2)
+	}
+	langs := detectCLPLanguages(*iso, r.ClipInfo)
+	if len(langs) > 0 {
+		logf("Detected CLP languages in order: %s", languageSummary(langs))
+	}
 	args := []string{ff, "-y", "-hide_banner", "-loglevel", "warning", "-i", movie}
 	for _, a := range audio {
 		args = append(args, "-i", a)
@@ -609,7 +644,19 @@ func main() {
 		maps = append(maps, "-map", fmt.Sprintf("%d:a:0", i+1))
 	}
 	args = append(args, maps...)
-	args = append(args, "-c:v", "copy", "-c:a", "flac", *out)
+	for i := range audio {
+		if i < len(langs) {
+			args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), "language="+langs[i].Code)
+			args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), "title="+langs[i].Name)
+		}
+	}
+	args = append(args, "-c:v", "copy")
+	if mode == "flac" {
+		args = append(args, "-c:a", "flac")
+	} else {
+		args = append(args, "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "256k")
+	}
+	args = append(args, *out)
 	logf("Muxing %d audio track(s)...", len(audio))
 	txt, err := runFFmpeg(args)
 	if err != nil {

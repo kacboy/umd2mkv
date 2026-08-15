@@ -70,6 +70,7 @@ const (
 	idSubs      = 109
 	idSelection = 110
 	idLog       = 111
+	idFLAC      = 112
 )
 
 var (
@@ -158,11 +159,12 @@ type IsoEntry struct {
 }
 
 type ScanResult struct {
-	Movie IsoEntry
-	Subs  []IsoEntry
+	Movie    IsoEntry
+	ClipInfo *IsoEntry
+	Subs     []IsoEntry
 }
 
-var hwndMain, hISO, hOut, hSelection, hLog, hConvert, hSubs, hFFStatus syscall.Handle
+var hwndMain, hISO, hOut, hSelection, hLog, hConvert, hSubs, hFLAC, hFFStatus syscall.Handle
 var converting atomic.Bool
 var uiQueue = make(chan func(), 256)
 
@@ -315,6 +317,8 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 				out := strings.TrimSpace(getText(hOut))
 				includeSubsRaw, _, _ := pSendMessageW.Call(uintptr(hSubs), BM_GETCHECK, 0, 0)
 				includeSubs := includeSubsRaw == BST_CHECKED
+				flacRaw, _, _ := pSendMessageW.Call(uintptr(hFLAC), BM_GETCHECK, 0, 0)
+				useFLAC := flacRaw == BST_CHECKED
 				if isoPath == "" || out == "" {
 					converting.Store(false)
 					message("Choose an ISO and output MKV first.", MB_OK|MB_ICONERROR)
@@ -329,7 +333,7 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 				enableControls(false)
 				setText(hConvert, "Converting...")
 				appendLog("Starting conversion worker...")
-				go doConvert(isoPath, out, ffmpeg, includeSubs)
+				go doConvert(isoPath, out, ffmpeg, includeSubs, useFLAC)
 			}
 		}
 		return 0
@@ -483,7 +487,19 @@ func scanISO(filename string) (ScanResult, error) {
 	}
 	sort.Slice(movies, func(i, j int) bool { return movies[i].Size > movies[j].Size })
 	sort.Slice(subs, func(i, j int) bool { return subs[i].Size > subs[j].Size })
-	return ScanResult{Movie: movies[0], Subs: subs}, nil
+	movie := movies[0]
+	stem := strings.TrimSuffix(movie.Name, filepath.Ext(movie.Name))
+	var clip *IsoEntry
+	for i := range entries {
+		e := entries[i]
+		up := strings.ToUpper(strings.ReplaceAll(e.Path, "\\", "/"))
+		if strings.Contains(up, "/UMD_VIDEO/CLIPINF/") && strings.EqualFold(filepath.Ext(e.Name), ".CLP") && strings.EqualFold(strings.TrimSuffix(e.Name, filepath.Ext(e.Name)), stem) {
+			x := e
+			clip = &x
+			break
+		}
+	}
+	return ScanResult{Movie: movie, ClipInfo: clip, Subs: subs}, nil
 }
 
 func extractEntry(isoPath string, e IsoEntry, out string) error {
@@ -898,6 +914,59 @@ func makeOMAHeader(headerCode1, headerCode2 byte) []byte {
 	return h
 }
 
+type LanguageInfo struct{ Code, Name string }
+
+var iso639 = map[string]LanguageInfo{
+	"eng": {"eng", "English"}, "fra": {"fre", "French"}, "fre": {"fre", "French"},
+	"spa": {"spa", "Spanish"}, "deu": {"ger", "German"}, "ger": {"ger", "German"},
+	"ita": {"ita", "Italian"}, "jpn": {"jpn", "Japanese"}, "por": {"por", "Portuguese"},
+	"nld": {"dut", "Dutch"}, "dut": {"dut", "Dutch"}, "rus": {"rus", "Russian"},
+	"kor": {"kor", "Korean"}, "zho": {"chi", "Chinese"}, "chi": {"chi", "Chinese"},
+	"ara": {"ara", "Arabic"}, "pol": {"pol", "Polish"}, "swe": {"swe", "Swedish"},
+	"nor": {"nor", "Norwegian"}, "dan": {"dan", "Danish"}, "fin": {"fin", "Finnish"},
+	"ces": {"cze", "Czech"}, "cze": {"cze", "Czech"}, "hun": {"hun", "Hungarian"}, "tur": {"tur", "Turkish"},
+}
+
+func detectCLPLanguages(isoPath string, clip *IsoEntry) []LanguageInfo {
+	if clip == nil {
+		return nil
+	}
+	tmp, err := os.CreateTemp("", "umd2mkv-clp-*.bin")
+	if err != nil {
+		return nil
+	}
+	name := tmp.Name()
+	tmp.Close()
+	defer os.Remove(name)
+	if extractEntryProgress(isoPath, *clip, name, nil) != nil {
+		return nil
+	}
+	b, err := os.ReadFile(name)
+	if err != nil {
+		return nil
+	}
+	var out []LanguageInfo
+	seen := map[string]bool{}
+	for i := 0; i+3 <= len(b); i++ {
+		raw := strings.ToLower(string(b[i : i+3]))
+		info, ok := iso639[raw]
+		if !ok || seen[info.Code] {
+			continue
+		}
+		seen[info.Code] = true
+		out = append(out, info)
+	}
+	return out
+}
+
+func languageSummary(langs []LanguageInfo) string {
+	parts := make([]string, 0, len(langs))
+	for _, l := range langs {
+		parts = append(parts, l.Code+" ("+l.Name+")")
+	}
+	return strings.Join(parts, ", ")
+}
+
 func doScan(path string) {
 	enableControls(false)
 	defer enableControls(true)
@@ -908,13 +977,21 @@ func doScan(path string) {
 		message(err.Error(), MB_OK|MB_ICONERROR)
 		return
 	}
-	s := fmt.Sprintf("Movie stream: %s - %s\r\nAudio: PSP private-stream audio will be demuxed from MPS\r\nSubtitles: %d separate candidate(s), plus any FFmpeg detects inside MPS", r.Movie.Path, humanSize(r.Movie.Size), len(r.Subs))
+	langs := detectCLPLanguages(path, r.ClipInfo)
+	langText := "not detected"
+	if len(langs) > 0 {
+		langText = languageSummary(langs)
+	}
+	s := fmt.Sprintf("Movie stream: %s - %s\r\nAudio: PSP private-stream audio will be demuxed from MPS\r\nLanguages (CLP, best effort): %s\r\nSubtitles: %d separate candidate(s)", r.Movie.Path, humanSize(r.Movie.Size), langText, len(r.Subs))
 	setText(hSelection, s)
 	appendLog("Selected movie stream: " + r.Movie.Path)
 	appendLog("Audio will be demuxed internally from PSP private-stream packets in the selected MPS.")
+	if len(langs) > 0 {
+		appendLog("CLP language candidates: " + languageSummary(langs))
+	}
 }
 
-func doConvert(isoPath, out, ffmpeg string, includeSubs bool) {
+func doConvert(isoPath, out, ffmpeg string, includeSubs, useFLAC bool) {
 	defer func() {
 		converting.Store(false)
 		postUI(func() {
@@ -969,6 +1046,15 @@ func doConvert(isoPath, out, ffmpeg string, includeSubs bool) {
 			postLog(fmt.Sprintf("Extracted audio: %s (%d bytes)", filepath.Base(a), st.Size()))
 		}
 	}
+	langs := detectCLPLanguages(isoPath, r.ClipInfo)
+	if len(langs) > 0 {
+		postLog("Detected CLP languages in order: " + languageSummary(langs))
+		if len(langs) != len(audioFiles) {
+			postLog(fmt.Sprintf("Language count (%d) differs from audio track count (%d); tagging only tracks with an ordered candidate.", len(langs), len(audioFiles)))
+		}
+	} else {
+		postLog("No CLP language codes detected; audio tracks will remain unlabeled.")
+	}
 
 	base := []string{ffmpeg, "-y", "-hide_banner", "-loglevel", "warning", "-i", movie}
 	for _, a := range audioFiles {
@@ -988,7 +1074,20 @@ func doConvert(isoPath, out, ffmpeg string, includeSubs bool) {
 	}
 	postLog(fmt.Sprintf("Stage 4/4: launching FFmpeg with video plus %d extracted audio track(s)...", len(audioFiles)))
 	args := append(append([]string{}, base...), maps...)
-	args = append(args, "-c:v", "copy", "-c:a", "flac", "-c:s", "copy", out)
+	for i := range audioFiles {
+		if i < len(langs) {
+			args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), "language="+langs[i].Code, fmt.Sprintf("-metadata:s:a:%d", i), "title="+langs[i].Name)
+		}
+	}
+	args = append(args, "-c:v", "copy")
+	if useFLAC {
+		postLog("Audio output: FLAC (lossless, larger files)")
+		args = append(args, "-c:a", "flac")
+	} else {
+		postLog("Audio output: AAC-LC 256 kbps (compatibility mode)")
+		args = append(args, "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "256k")
+	}
+	args = append(args, "-c:s", "copy", out)
 	logText, er := runFFmpeg(args)
 	if er != nil && includeSubs && len(subFiles) > 0 {
 		postLog("Subtitle mux failed; retrying video/audio without separate subtitle files.")
@@ -1001,7 +1100,18 @@ func doConvert(isoPath, out, ffmpeg string, includeSubs bool) {
 			maps2 = append(maps2, "-map", fmt.Sprintf("%d:a:0", i+1))
 		}
 		args = append(append([]string{}, base2...), maps2...)
-		args = append(args, "-c:v", "copy", "-c:a", "flac", out)
+		for i := range audioFiles {
+			if i < len(langs) {
+				args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), "language="+langs[i].Code, fmt.Sprintf("-metadata:s:a:%d", i), "title="+langs[i].Name)
+			}
+		}
+		args = append(args, "-c:v", "copy")
+		if useFLAC {
+			args = append(args, "-c:a", "flac")
+		} else {
+			args = append(args, "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "256k")
+		}
+		args = append(args, out)
 		logText, er = runFFmpeg(args)
 	}
 	if er != nil {
@@ -1033,12 +1143,13 @@ func main() {
 	hSelection = createControl("EDIT", "Choose an ISO; it will be scanned automatically.", WS_BORDER|ES_MULTILINE|ES_READONLY, 20, 158, 745, 72, hwndMain, idSelection)
 	hSubs = createControl("BUTTON", "Try to include subtitles", BS_AUTOCHECKBOX|WS_TABSTOP, 20, 242, 220, 26, hwndMain, idSubs)
 	pSendMessageW.Call(uintptr(hSubs), BM_SETCHECK, BST_CHECKED, 0)
+	hFLAC = createControl("BUTTON", "Use lossless FLAC audio (larger files)", BS_AUTOCHECKBOX|WS_TABSTOP, 260, 242, 280, 26, hwndMain, idFLAC)
 	hConvert = createControl("BUTTON", "Convert to MKV", BS_DEFPUSHBUTTON|WS_TABSTOP, 20, 278, 150, 34, hwndMain, idConvert)
 	createControl("STATIC", "Log:", SS_LEFT, 20, 324, 80, 22, hwndMain, 0)
 	hLog = createControl("EDIT", "", WS_BORDER|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY, 20, 346, 745, 228, hwndMain, idLog)
 	pShowWindow.Call(uintptr(hwndMain), SW_SHOW)
 	pUpdateWindow.Call(uintptr(hwndMain))
-	appendLog("UMD2MKV PSP frame-rebuild build ready. Selecting an ISO scans automatically.")
+	appendLog("UMD2MKV 1.1.0 ready. AAC-LC 256k is the default; FLAC is optional. Selecting an ISO scans automatically.")
 	updateFFmpegStatus(true)
 	var msg MSG
 	for {

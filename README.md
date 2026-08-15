@@ -2,7 +2,7 @@
 
 UMD2MKV extracts the largest movie stream from a PSP UMD Video ISO, reconstructs its PSP ATRAC3+ audio streams, and remuxes the result to Matroska (MKV) using FFmpeg.
 
-The video stream is copied without re-encoding. PSP ATRAC3+ audio is rebuilt into temporary OMA streams and converted to lossless FLAC for the MKV.
+The H.264 video stream is copied without re-encoding. By default, ATRAC3+ audio is converted to **AAC-LC at 256 kbps per track** for broad playback compatibility and a much smaller file than lossless FLAC. A lossless FLAC mode remains available.
 
 ## Platforms
 
@@ -10,7 +10,7 @@ The video stream is copied without re-encoding. PSP ATRAC3+ audio is rebuilt int
 - **macOS:** CLI builds for Intel and Apple Silicon.
 - **Linux:** CLI builds for amd64 and arm64.
 
-GitHub Actions builds all of these automatically on every push and pull request.
+GitHub Actions builds all of these automatically on every push, pull request, or manual workflow run.
 
 ## Requirements
 
@@ -18,11 +18,9 @@ FFmpeg must be installed and available on `PATH`, or placed beside the executabl
 
 ### Windows
 
-Download `ffmpeg.exe` and place it beside `UMD2MKV.exe`, or add FFmpeg to PATH.
+Place `ffmpeg.exe` beside `UMD2MKV.exe`, or add FFmpeg to PATH. The GUI checks for FFmpeg at startup and has a **Recheck** button.
 
 ### macOS
-
-For example with Homebrew:
 
 ```sh
 brew install ffmpeg
@@ -30,41 +28,57 @@ brew install ffmpeg
 
 ### Linux
 
-Use your distribution package manager, for example:
+For example:
 
 ```sh
 sudo apt install ffmpeg
 ```
 
+## Windows GUI
+
+Choose a UMD Video ISO and it is scanned automatically. The GUI selects the largest `UMD_VIDEO/STREAM/*.MPS`, shows any language metadata it can recognize, and converts it to MKV.
+
+Audio defaults to **AAC-LC 256 kbps**. Enable **Use lossless FLAC audio (larger files)** if you want an archival/lossless intermediate transcode instead.
+
 ## CLI usage
+
+Default AAC-LC output:
 
 ```sh
 umd2mkv -iso /path/to/movie.iso -out movie.mkv
 ```
 
-To inspect the ISO without converting it:
+Lossless FLAC audio:
+
+```sh
+umd2mkv -iso /path/to/movie.iso -out movie.mkv -audio flac
+```
+
+Inspect the selected movie and language metadata without converting:
 
 ```sh
 umd2mkv -iso /path/to/movie.iso -inspect
 ```
 
-The inspect command reports the selected `UMD_VIDEO/STREAM/*.MPS`, its matching `CLIPINF/*.CLP` when present, and any recognizable ISO-639 language-code candidates found in the CLP metadata.
+## Audio language labels
 
-## Audio languages
+UMD Video discs can contain multiple language tracks. UMD2MKV looks for the `.CLP` file matching the selected `.MPS` (for example `STREAM/00001.MPS` -> `CLIPINF/00001.CLP`) and scans it for recognized ISO-639 language codes.
 
-Official UMD Video authoring data supports language attributes for audio streams, and those attributes are associated with clip metadata. Unfortunately the public UMD Video format documentation is incomplete, so UMD2MKV currently treats automatic language detection as **experimental**.
+When codes are found, they are assigned to reconstructed audio tracks in on-disc order. For example, three detected codes `eng`, `fre`, `spa` applied to PSP audio substreams `00`, `01`, `02` become MKV tracks tagged as English, French, and Spanish.
 
-The CLI `-inspect` mode scans the matching `.CLP` file for recognizable ISO-639 language codes. It deliberately does **not** automatically assign those labels to MKV tracks yet, because a false mapping is worse than an unlabeled track. Once the ordering is verified against a few real discs, the detected codes can be written directly into Matroska track metadata.
+This is **best-effort** because the complete commercial UMD Video CLP binary format is not publicly documented. The converter logs the detected order before FFmpeg runs. If no recognized codes are found, tracks are left unlabeled rather than guessing.
 
 ## How conversion works
 
 1. Read the ISO9660 filesystem directly; mounting/extracting the ISO first is not required.
 2. Find the largest `.MPS` under `UMD_VIDEO/STREAM`.
-3. Extract that stream to a temporary directory.
-4. Parse the MPEG program stream and collect genuine PSP `private_stream_1` audio substreams.
-5. Rebuild PSP `0F D0` ATRAC3+ sound frames into Sony EA3/OMA streams.
-6. Run FFmpeg with H.264 video stream-copy and lossless FLAC audio.
-7. Write the final MKV.
+3. Find the corresponding `.CLP` under `UMD_VIDEO/CLIPINF` for language metadata.
+4. Extract the selected MPS to a temporary directory.
+5. Parse the MPEG program stream and collect genuine PSP `private_stream_1` audio substreams.
+6. Rebuild PSP `0F D0` ATRAC3+ sound frames into Sony EA3/OMA streams.
+7. Run FFmpeg with H.264 video stream-copy and either AAC-LC 256 kbps (default) or FLAC audio.
+8. Write Matroska language/title metadata for audio tracks when CLP language codes were detected.
+9. Write the final MKV.
 
 ## Building locally
 
@@ -82,12 +96,23 @@ go build ./cmd/umd2mkv
 go build -ldflags="-H=windowsgui" -o UMD2MKV.exe ./cmd/umd2mkv-gui
 ```
 
+## GitHub Actions builds
+
+The included `.github/workflows/build.yml` produces downloadable artifacts for:
+
+- Windows GUI (`UMD2MKV.exe`)
+- Windows CLI
+- Linux amd64 / arm64
+- macOS Intel / Apple Silicon
+
+Open **Actions -> build** in GitHub after pushing the repo, or use **Run workflow** manually.
+
 ## Current limitations
 
-- The cross-platform build is currently CLI-first. The proven Win32 GUI remains Windows-only.
-- Automatic audio-language labeling is experimental.
-- UMD subtitle streams are not fully decoded yet; external subtitle files found in unusual disc layouts may be muxed by the Windows GUI.
-- The main feature is selected by largest `.MPS` size, which is intentionally simple and may select a long bonus feature on unusual discs.
+- The cross-platform build is CLI-first; the Win32 GUI is Windows-only.
+- Audio-language mapping is best-effort and depends on recognizable codes in the matching CLP file.
+- UMD subtitle streams are not fully decoded yet; separate recognizable subtitle files are only attempted by the Windows GUI.
+- The main feature is selected by largest `.MPS` size, which can theoretically select a long bonus feature on an unusual disc.
 
 ## Legal
 
