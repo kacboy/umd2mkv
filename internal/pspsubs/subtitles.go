@@ -552,33 +552,31 @@ func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)
 		if er != nil {
 			return nil, er
 		}
+
 		validFrames := 0
 		for i, r := range recs {
-			if er = writeDisplaySet(wf, r, uint16(i*2), 720, 480); er != nil {
+			if frameErr := writeDisplaySet(wf, r, uint16(i*2), 720, 480); frameErr != nil {
 				if logf != nil {
-					logf(fmt.Sprintf("Warning: subtitle stream %02X frame %d skipped (%v)", so.id, i, er))
+					logf(fmt.Sprintf("Warning: subtitle stream %02X frame %d skipped (%v)", so.id, i, frameErr))
 				}
 				continue
 			}
 			validFrames++
 		}
 
+		if ce := wf.Close(); ce != nil {
+			return nil, fmt.Errorf("subtitle stream %02X: %w", so.id, ce)
+		}
+
 		if validFrames == 0 {
-			wf.Close()
 			os.Remove(out)
 			return nil, fmt.Errorf("subtitle stream %02X: no valid PNG records could be rendered", so.id)
 		}
-		ce := wf.Close()
-		if er == nil {
-			er = ce
-		}
-		if !ok || er != nil {
-			return nil, fmt.Errorf("subtitle stream %02X: %w", so.id, er)
-		}
-		t := Track{StreamID: so.id, Language: lang, Path: out, Records: len(recs), Packets: so.packets, Bytes: so.bytes}
+
+		t := Track{StreamID: so.id, Language: lang, Path: out, Records: validFrames, Packets: so.packets, Bytes: so.bytes}
 		tracks = append(tracks, t)
 		if logf != nil {
-			logf(fmt.Sprintf("Subtitle stream %02X: %d image subtitle(s) -> %s", so.id, len(recs), filepath.Base(out)))
+			logf(fmt.Sprintf("Subtitle stream %02X: %d image subtitle(s) -> %s", so.id, validFrames, filepath.Base(out)))
 		}
 		os.Remove(so.path)
 	}
