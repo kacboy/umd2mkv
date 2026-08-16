@@ -1640,11 +1640,11 @@ func main() {
 	hConvert = createControl("BUTTON", "Convert to MKV", BS_DEFPUSHBUTTON|WS_TABSTOP, 20, 278, 150, 34, hwndMain, idConvert)
 	createControl("STATIC", "Log:", SS_LEFT, 20, 324, 80, 22, hwndMain, 0)
 	hLog = createControl("EDIT", "", WS_BORDER|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY, 20, 346, 745, 210, hwndMain, idLog)
-	createControl("STATIC", "UMD2MKV v1.2.0", SS_LEFT, 20, 568, 220, 22, hwndMain, 0)
+	createControl("STATIC", "UMD2MKV v1.2.1", SS_LEFT, 20, 568, 220, 22, hwndMain, 0)
 	createControl("STATIC", "@kacboy", SS_RIGHT, 545, 568, 220, 22, hwndMain, 0)
 	pShowWindow.Call(uintptr(hwndMain), SW_SHOW)
 	pUpdateWindow.Call(uintptr(hwndMain))
-	appendLog("UMD2MKV v1.2.0 ready. AAC-LC 256k is recommended; FLAC is optional. UMD PNG subtitles can be preserved as selectable PGS tracks.")
+	appendLog("UMD2MKV v1.2.1 ready. AAC-LC 256k is recommended; FLAC is optional. UMD PNG subtitles can be preserved as selectable PGS tracks.")
 	updateFFmpegStatus(true)
 	var msg MSG
 	for {

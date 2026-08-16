@@ -61,6 +61,54 @@ func decodePTS(h []byte) (int64, bool) {
 	return pts, true
 }
 
+func findFirstVideoPTS(mpsPath string) (int64, error) {
+	f, err := os.Open(mpsPath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	size := st.Size()
+
+	buf := make([]byte, 64*1024)
+	var off int64
+
+	for off < size {
+		n, err := f.ReadAt(buf, off)
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
+
+		for i := 0; i+14 <= n; i++ {
+			// MPEG PES video streams are E0-EF.
+			if buf[i] != 0x00 ||
+				buf[i+1] != 0x00 ||
+				buf[i+2] != 0x01 ||
+				buf[i+3] < 0xE0 ||
+				buf[i+3] > 0xEF {
+				continue
+			}
+
+			if pts, ok := decodePTS(buf[i:]); ok {
+				return pts, nil
+			}
+		}
+
+		if n < len(buf) {
+			break
+		}
+
+		// overlap enough bytes so a PES header split between reads isn't lost
+		off += int64(n - 16)
+	}
+
+	return 0, fmt.Errorf("no video PTS found")
+}
+
 func findPacket(meta []packetMeta, off int64) (packetMeta, bool) {
 	lo, hi := 0, len(meta)
 	for lo < hi {
@@ -523,6 +571,18 @@ func writeDisplaySet(w io.Writer, rec record, comp uint16, videoW, videoH int) e
 // BuildPGS extracts all UMD subtitle private streams and converts their original
 // PNG artwork/timing into standard HDMV PGS .sup tracks suitable for Matroska.
 func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)) ([]Track, error) {
+	videoBasePTS, err := findFirstVideoPTS(mpsPath)
+	if err != nil {
+		return nil, fmt.Errorf("find video time origin: %w", err)
+	}
+
+	if logf != nil {
+		logf(fmt.Sprintf(
+			"Video PTS origin: %d (%.3f sec)",
+			videoBasePTS,
+			float64(videoBasePTS)/90000.0,
+		))
+	}
 	streams, err := collectPrivateSubtitleStreams(mpsPath, outDir, logf)
 	if err != nil {
 		return nil, err
@@ -539,8 +599,35 @@ func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)
 		if er != nil {
 			return nil, er
 		}
+
 		if len(recs) == 0 {
 			continue
+		}
+
+		if logf != nil {
+			logf(fmt.Sprintf(
+				"Subtitle %02X raw first PTS: %d (%.3f sec), video base: %d (%.3f sec)",
+				so.id,
+				recs[0].startPTS,
+				float64(recs[0].startPTS)/90000.0,
+				videoBasePTS,
+				float64(videoBasePTS)/90000.0,
+			))
+		}
+
+		for i := range recs {
+			recs[i].startPTS -= videoBasePTS
+			if recs[i].startPTS < 0 {
+				recs[i].startPTS = 0
+			}
+		}
+
+		if logf != nil {
+			logf(fmt.Sprintf(
+				"Subtitle %02X corrected first event: %.3f sec",
+				so.id,
+				float64(recs[0].startPTS)/90000.0,
+			))
 		}
 		lang := langs[so.id]
 		suffix := lang.Code
