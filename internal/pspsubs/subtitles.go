@@ -46,7 +46,6 @@ type record struct {
 	duration int64
 	x, y     int
 	pngData  []byte
-	header   [18]byte
 }
 
 func decodePTS(h []byte) (int64, bool) {
@@ -348,16 +347,7 @@ func extractRecords(so *rawStream) ([]record, error) {
 		x := int(binary.BigEndian.Uint16(data[start+12 : start+14]))
 		y := int(binary.BigEndian.Uint16(data[start+14 : start+16]))
 		p := append([]byte(nil), data[pngPos:start+total]...)
-		var header [18]byte
-		copy(header[:], data[start:start+18])
-		out = append(out, record{
-			startPTS: m.pts,
-			duration: dur,
-			x:         x,
-			y:         y,
-			pngData:   p,
-			header:    header,
-		})
+		out = append(out, record{startPTS: m.pts, duration: dur, x: x, y: y, pngData: p})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].startPTS < out[j].startPTS })
 	return out, nil
@@ -492,6 +482,18 @@ func makePCS(width, height int, comp uint16, state byte, object bool, x, y int) 
 	return p
 }
 
+// writeZeroAnchor emits an empty PGS display set at PTS 0.
+// FFmpeg otherwise may treat the first real subtitle packet as the SUP input's
+// time origin and rebase it to 0 during muxing.  Anchoring the stream at zero
+// preserves the absolute PTS of the real subtitle events.
+func writeZeroAnchor(w io.Writer, videoW, videoH int) error {
+	pcs := makePCS(videoW, videoH, 0, 0x80, false, 0, 0)
+	if err := writeSeg(w, 0, 0x16, pcs); err != nil {
+		return err
+	}
+	return writeSeg(w, 0, 0x80, nil)
+}
+
 func writeDisplaySet(w io.Writer, rec record, comp uint16, videoW, videoH int) error {
 	img, err := png.Decode(bytes.NewReader(rec.pngData))
 	if err != nil {
@@ -581,17 +583,20 @@ func writeDisplaySet(w io.Writer, rec record, comp uint16, videoW, videoH int) e
 // BuildPGS extracts all UMD subtitle private streams and converts their original
 // PNG artwork/timing into standard HDMV PGS .sup tracks suitable for Matroska.
 func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)) ([]Track, error) {
+	videoBasePTS, err := findFirstVideoPTS(mpsPath)
+	if err != nil {
+		return nil, fmt.Errorf("find video time origin: %w", err)
+	}
+
 	streams, err := collectPrivateSubtitleStreams(mpsPath, outDir, logf)
 	if err != nil {
 		return nil, err
 	}
-
 	ids := make([]int, 0, len(streams))
 	for id := range streams {
 		ids = append(ids, int(id))
 	}
 	sort.Ints(ids)
-
 	tracks := make([]Track, 0, len(ids))
 	for _, ii := range ids {
 		so := streams[byte(ii)]
@@ -599,31 +604,15 @@ func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)
 		if er != nil {
 			return nil, er
 		}
+
 		if len(recs) == 0 {
 			continue
 		}
 
-		// Diagnostic dump: preserve the original subtitle PES timestamps and
-		// show the complete PSP 0088 record header for the first few events.
-		if logf != nil {
-			limit := len(recs)
-			if limit > 8 {
-				limit = 8
-			}
-			for i := 0; i < limit; i++ {
-				r := recs[i]
-				logf(fmt.Sprintf(
-					"Subtitle %02X record %d: PES_PTS=%d (%.3f sec) durationRaw=%d (%.3f sec @90k) x=%d y=%d header=% X",
-					so.id,
-					i,
-					r.startPTS,
-					float64(r.startPTS)/90000.0,
-					r.duration,
-					float64(r.duration)/90000.0,
-					r.x,
-					r.y,
-					r.header[:],
-				))
+		for i := range recs {
+			recs[i].startPTS -= videoBasePTS
+			if recs[i].startPTS < 0 {
+				recs[i].startPTS = 0
 			}
 		}
 
@@ -636,6 +625,13 @@ func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)
 		wf, er := os.Create(out)
 		if er != nil {
 			return nil, er
+		}
+
+		// Anchor the SUP stream at PTS 0 so FFmpeg does not rebase the first
+		// real subtitle event to the beginning of the output.
+		if er := writeZeroAnchor(wf, 720, 480); er != nil {
+			wf.Close()
+			return nil, fmt.Errorf("subtitle stream %02X zero anchor: %w", so.id, er)
 		}
 
 		validFrames := 0
@@ -652,6 +648,7 @@ func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)
 		if ce := wf.Close(); ce != nil {
 			return nil, fmt.Errorf("subtitle stream %02X: %w", so.id, ce)
 		}
+
 		if validFrames == 0 {
 			os.Remove(out)
 			return nil, fmt.Errorf("subtitle stream %02X: no valid PNG records could be rendered", so.id)
