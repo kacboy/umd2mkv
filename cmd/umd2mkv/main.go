@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/kacboy/umd2mkv/internal/pspsubs"
 )
 
 const sectorSize = 2048
@@ -517,22 +519,40 @@ func makeOMAHeader(c1, c2 byte) []byte {
 }
 
 type LanguageInfo struct {
-	Code string
-	Name string
+	StreamID byte
+	Code     string
+	Name     string
 }
 
-var iso639 = map[string]LanguageInfo{
-	"eng": {"eng", "English"}, "fra": {"fre", "French"}, "fre": {"fre", "French"},
-	"spa": {"spa", "Spanish"}, "deu": {"ger", "German"}, "ger": {"ger", "German"},
-	"ita": {"ita", "Italian"}, "jpn": {"jpn", "Japanese"}, "por": {"por", "Portuguese"},
-	"nld": {"dut", "Dutch"}, "dut": {"dut", "Dutch"}, "rus": {"rus", "Russian"},
-	"kor": {"kor", "Korean"}, "zho": {"chi", "Chinese"}, "chi": {"chi", "Chinese"},
-	"ara": {"ara", "Arabic"}, "pol": {"pol", "Polish"}, "swe": {"swe", "Swedish"},
-	"nor": {"nor", "Norwegian"}, "dan": {"dan", "Danish"}, "fin": {"fin", "Finnish"},
-	"ces": {"cze", "Czech"}, "cze": {"cze", "Czech"}, "hun": {"hun", "Hungarian"},
-	"tur": {"tur", "Turkish"},
+var iso6392 = map[string]LanguageInfo{
+	"en": {Code: "eng", Name: "English"},
+	"fr": {Code: "fra", Name: "French"},
+	"es": {Code: "spa", Name: "Spanish"},
+	"de": {Code: "deu", Name: "German"},
+	"it": {Code: "ita", Name: "Italian"},
+	"ja": {Code: "jpn", Name: "Japanese"},
+	"pt": {Code: "por", Name: "Portuguese"},
+	"nl": {Code: "nld", Name: "Dutch"},
+	"ru": {Code: "rus", Name: "Russian"},
+	"ko": {Code: "kor", Name: "Korean"},
+	"zh": {Code: "zho", Name: "Chinese"},
+	"ar": {Code: "ara", Name: "Arabic"},
+	"pl": {Code: "pol", Name: "Polish"},
+	"sv": {Code: "swe", Name: "Swedish"},
+	"no": {Code: "nor", Name: "Norwegian"},
+	"da": {Code: "dan", Name: "Danish"},
+	"fi": {Code: "fin", Name: "Finnish"},
+	"cs": {Code: "ces", Name: "Czech"},
+	"hu": {Code: "hun", Name: "Hungarian"},
+	"tr": {Code: "tur", Name: "Turkish"},
 }
 
+// detectCLPLanguages parses the UMD Video clip descriptor table.  Audio
+// descriptors use private_stream_1 (0xBD), followed by the PSP substream ID.
+// In the tested retail CLP layout the two-byte ISO-639-1 language code is at
+// descriptor offsets +8/+9.  Audio substreams are 0x00-0x1F; 0x80+ entries
+// describe other private streams (commonly subtitles) and are intentionally
+// not returned here.
 func detectCLPLanguages(isoPath string, clip *IsoEntry) []LanguageInfo {
 	if clip == nil {
 		return nil
@@ -552,35 +572,109 @@ func detectCLPLanguages(isoPath string, clip *IsoEntry) []LanguageInfo {
 		return nil
 	}
 	var out []LanguageInfo
-	seen := map[string]bool{}
-	for i := 0; i+3 <= len(b); i++ {
-		raw := strings.ToLower(string(b[i : i+3]))
-		info, ok := iso639[raw]
-		if !ok || seen[info.Code] {
+	seen := map[byte]bool{}
+	for i := 0; i+14 <= len(b); i++ {
+		if b[i] != 0xBD {
 			continue
 		}
-		seen[info.Code] = true
+		streamID := b[i+1]
+		if streamID >= 0x20 || seen[streamID] {
+			continue
+		}
+		// Retail UMD Video CLP stream descriptors observed here are 14 bytes:
+		// BD <id> 00 00 00 08 F0 00 <lang2> ...
+		if b[i+2] != 0x00 || b[i+3] != 0x00 || b[i+4] != 0x00 || b[i+5] != 0x08 || b[i+6] != 0xF0 || b[i+7] != 0x00 {
+			continue
+		}
+		raw := strings.ToLower(string(b[i+8 : i+10]))
+		info, ok := iso6392[raw]
+		if !ok {
+			continue
+		}
+		info.StreamID = streamID
+		seen[streamID] = true
 		out = append(out, info)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StreamID < out[j].StreamID })
 	return out
+}
+
+func languageForAudioFile(path string, langs []LanguageInfo) (LanguageInfo, bool) {
+	base := strings.ToUpper(filepath.Base(path))
+	for _, l := range langs {
+		needle := fmt.Sprintf("_STREAM_%02X", l.StreamID)
+		if strings.Contains(base, needle) {
+			return l, true
+		}
+	}
+	return LanguageInfo{}, false
 }
 
 func languageSummary(langs []LanguageInfo) string {
 	parts := make([]string, 0, len(langs))
 	for _, l := range langs {
-		parts = append(parts, l.Code+" ("+l.Name+")")
+		parts = append(parts, fmt.Sprintf("%02X=%s (%s)", l.StreamID, l.Code, l.Name))
 	}
 	return strings.Join(parts, ", ")
+}
+
+func detectCLPPrivateLanguages(isoPath string, clip *IsoEntry) map[byte]LanguageInfo {
+	out := map[byte]LanguageInfo{}
+	if clip == nil {
+		return out
+	}
+	tmp, err := os.CreateTemp("", "umd2mkv-clp-*.bin")
+	if err != nil {
+		return out
+	}
+	name := tmp.Name()
+	tmp.Close()
+	defer os.Remove(name)
+	if extractEntryProgress(isoPath, *clip, name, nil) != nil {
+		return out
+	}
+	b, err := os.ReadFile(name)
+	if err != nil {
+		return out
+	}
+	for i := 0; i+14 <= len(b); i++ {
+		if b[i] != 0xBD {
+			continue
+		}
+		id := b[i+1]
+		if id < 0x80 || id > 0x9F {
+			continue
+		}
+		if b[i+2] != 0 || b[i+3] != 0 || b[i+4] != 0 || b[i+5] != 0x08 || b[i+6] != 0xF0 || b[i+7] != 0 {
+			continue
+		}
+		raw := strings.ToLower(string(b[i+8 : i+10]))
+		if info, ok := iso6392[raw]; ok {
+			info.StreamID = id
+			out[id] = info
+		}
+	}
+	return out
+}
+
+func subtitleLanguageMap(in map[byte]LanguageInfo) map[byte]pspsubs.Language {
+	out := map[byte]pspsubs.Language{}
+	for id, li := range in {
+		out[id] = pspsubs.Language{Code: li.Code, Name: li.Name}
+	}
+	return out
 }
 
 func main() {
 	iso := flag.String("iso", "", "path to PSP UMD Video ISO")
 	out := flag.String("out", "", "output MKV path")
-	inspect := flag.Bool("inspect", false, "scan ISO and print selected stream / CLP language-code candidates")
+	inspect := flag.Bool("inspect", false, "scan ISO metadata and print detected CLP track labels")
+	scanTracks := flag.Bool("scan-tracks", false, "deep-scan the selected MPS and report actual audio/subtitle tracks without creating an MKV")
 	audioMode := flag.String("audio", "aac", "audio output: aac (default, AAC-LC 256k) or flac")
+	includeSubs := flag.Bool("subs", true, "include original UMD image subtitles as selectable PGS tracks")
 	flag.Parse()
 	if *iso == "" {
-		fmt.Fprintln(os.Stderr, "usage: umd2mkv -iso movie.iso [-out movie.mkv] [-inspect]")
+		fmt.Fprintln(os.Stderr, "usage: umd2mkv -iso movie.iso [-out movie.mkv] [-audio aac|flac] [-subs=true|false] [-inspect] [-scan-tracks]")
 		os.Exit(2)
 	}
 	r, err := scanISO(*iso)
@@ -589,16 +683,72 @@ func main() {
 		os.Exit(1)
 	}
 	logf("Movie: %s (%d bytes)", r.Movie.Path, r.Movie.Size)
-	if r.ClipInfo != nil {
-		logf("Clip info: %s", r.ClipInfo.Path)
-		langs := detectCLPLanguages(*iso, r.ClipInfo)
-		if len(langs) > 0 {
-			logf("CLP language-code candidates: %s", languageSummary(langs))
-		} else {
-			logf("CLP language-code candidates: none confidently recognized")
+	langs := detectCLPLanguages(*iso, r.ClipInfo)
+	if len(langs) > 0 {
+		logf("Audio tracks (CLP): %s", languageSummary(langs))
+	}
+	priv := detectCLPPrivateLanguages(*iso, r.ClipInfo)
+	if len(priv) > 0 {
+		ids := make([]int, 0, len(priv))
+		for id := range priv {
+			ids = append(ids, int(id))
+		}
+		sort.Ints(ids)
+		for _, ii := range ids {
+			li := priv[byte(ii)]
+			logf("Subtitle %02X (CLP): %s [%s]", ii, li.Name, li.Code)
 		}
 	}
-	if *inspect {
+	if *inspect && !*scanTracks {
+		return
+	}
+	mode := strings.ToLower(strings.TrimSpace(*audioMode))
+	if mode != "aac" && mode != "flac" {
+		fmt.Fprintln(os.Stderr, "-audio must be aac or flac")
+		os.Exit(2)
+	}
+	tmp, err := os.MkdirTemp("", "umd2mkv-")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(tmp)
+	movie := filepath.Join(tmp, "movie.mps")
+	logf("Extracting movie stream...")
+	if err = extractEntryProgress(*iso, r.Movie, movie, func(p int) { logf("Movie extraction: %d%%", p) }); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	logf("Scanning/rebuilding PSP ATRAC3+ audio...")
+	audio, err := demuxAtracFromMPS(movie, tmp)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if *scanTracks {
+		logf("Actual audio tracks: %d", len(audio))
+		for _, a := range audio {
+			if li, ok := languageForAudioFile(a, langs); ok {
+				logf("  Audio %02X: %s [%s]", li.StreamID, li.Name, li.Code)
+			} else {
+				logf("  Audio: %s", filepath.Base(a))
+			}
+		}
+		tracks, serr := pspsubs.Scan(movie, tmp, subtitleLanguageMap(priv), func(s string) { logf("%s", s) })
+		if serr != nil {
+			logf("Subtitle scan: %v", serr)
+		} else {
+			logf("Actual subtitle tracks: %d", len(tracks))
+			for _, t := range tracks {
+				name, code := "Unknown", "und"
+				if t.Language.Name != "" {
+					name = t.Language.Name
+				}
+				if t.Language.Code != "" {
+					code = t.Language.Code
+				}
+				logf("  Subtitle %02X: %s [%s], %d images", t.StreamID, name, code, t.Records)
+			}
+		}
 		return
 	}
 	ff := findFFmpeg()
@@ -609,46 +759,45 @@ func main() {
 	if *out == "" {
 		*out = strings.TrimSuffix(*iso, filepath.Ext(*iso)) + ".mkv"
 	}
-	tmp, err := os.MkdirTemp("", "umd2mkv-")
-	if err != nil {
-		panic(err)
-	}
-	defer os.RemoveAll(tmp)
-	movie := filepath.Join(tmp, "movie.mps")
-	logf("Extracting movie...")
-	if err = extractEntryProgress(*iso, r.Movie, movie, func(p int) { logf("Movie extraction: %d%%", p) }); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	logf("Extracting PSP ATRAC3+ audio...")
-	audio, err := demuxAtracFromMPS(movie, tmp)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	mode := strings.ToLower(strings.TrimSpace(*audioMode))
-	if mode != "aac" && mode != "flac" {
-		fmt.Fprintln(os.Stderr, "-audio must be aac or flac")
-		os.Exit(2)
-	}
-	langs := detectCLPLanguages(*iso, r.ClipInfo)
-	if len(langs) > 0 {
-		logf("Detected CLP languages in order: %s", languageSummary(langs))
+	var subTracks []pspsubs.Track
+	if *includeSubs {
+		logf("Extracting original UMD PNG subtitles as PGS...")
+		subTracks, err = pspsubs.BuildPGS(movie, tmp, subtitleLanguageMap(priv), func(s string) { logf("%s", s) })
+		if err != nil {
+			logf("Subtitle extraction skipped: %v", err)
+			subTracks = nil
+		}
 	}
 	args := []string{ff, "-y", "-hide_banner", "-loglevel", "warning", "-i", movie}
 	for _, a := range audio {
 		args = append(args, "-i", a)
 	}
+	for _, t := range subTracks {
+		args = append(args, "-i", t.Path)
+	}
 	maps := []string{"-map", "0:v:0"}
 	for i := range audio {
 		maps = append(maps, "-map", fmt.Sprintf("%d:a:0", i+1))
 	}
+	for i := range subTracks {
+		maps = append(maps, "-map", fmt.Sprintf("%d:s:0", 1+len(audio)+i))
+	}
 	args = append(args, maps...)
-	for i := range audio {
-		if i < len(langs) {
-			args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), "language="+langs[i].Code)
-			args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), "title="+langs[i].Name)
+	for i, audioFile := range audio {
+		if lang, ok := languageForAudioFile(audioFile, langs); ok {
+			args = append(args, fmt.Sprintf("-metadata:s:a:%d", i), "language="+lang.Code, fmt.Sprintf("-metadata:s:a:%d", i), "title="+lang.Name)
+			logf("Audio stream %02X -> %s [%s]", lang.StreamID, lang.Name, lang.Code)
 		}
+	}
+	for i, t := range subTracks {
+		code, name := "und", fmt.Sprintf("UMD Subtitle %02X", t.StreamID)
+		if t.Language.Code != "" {
+			code = t.Language.Code
+		}
+		if t.Language.Name != "" {
+			name = t.Language.Name
+		}
+		args = append(args, fmt.Sprintf("-metadata:s:s:%d", i), "language="+code, fmt.Sprintf("-metadata:s:s:%d", i), "title="+name)
 	}
 	args = append(args, "-c:v", "copy")
 	if mode == "flac" {
@@ -656,8 +805,11 @@ func main() {
 	} else {
 		args = append(args, "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "256k")
 	}
+	if len(subTracks) > 0 {
+		args = append(args, "-c:s", "copy")
+	}
 	args = append(args, *out)
-	logf("Muxing %d audio track(s)...", len(audio))
+	logf("Muxing %d audio track(s) and %d subtitle track(s)...", len(audio), len(subTracks))
 	txt, err := runFFmpeg(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, txt)

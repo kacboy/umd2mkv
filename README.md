@@ -36,9 +36,16 @@ sudo apt install ffmpeg
 
 ## Windows GUI
 
-Choose a UMD Video ISO and it is scanned automatically. The GUI selects the largest `UMD_VIDEO/STREAM/*.MPS`, shows any language metadata it can recognize, and converts it to MKV.
+Choose a UMD Video ISO and it is scanned automatically. The GUI selects the largest `UMD_VIDEO/STREAM/*.MPS` and shows the audio/subtitle language descriptors found in its matching `.CLP`.
 
-Audio defaults to **AAC-LC 256 kbps**. Enable **Use lossless FLAC audio (larger files)** if you want an archival/lossless intermediate transcode instead.
+Selecting an ISO automatically scans the disc and shows the detected movie, audio languages, and subtitle languages before conversion. There is no separate scan step in the GUI.
+
+Audio output is selectable before conversion:
+
+- **AAC 256k (recommended):** AAC-LC at 256 kbps per track for broad compatibility and smaller output.
+- **FLAC (lossless):** lossless conversion of the decoded ATRAC3+ audio, faster on some systems but much larger.
+
+**Include UMD subtitles (PGS)** is enabled by default. UMD2MKV preserves the original PNG subtitle artwork, timing, placement, and CLP language labels as selectable PGS tracks in the MKV.
 
 ## CLI usage
 
@@ -54,19 +61,31 @@ Lossless FLAC audio:
 umd2mkv -iso /path/to/movie.iso -out movie.mkv -audio flac
 ```
 
-Inspect the selected movie and language metadata without converting:
+Inspect the selected movie and CLP language metadata without converting:
 
 ```sh
 umd2mkv -iso /path/to/movie.iso -inspect
 ```
 
+Deep-scan the actual audio/subtitle streams without converting:
+
+```sh
+umd2mkv -iso /path/to/movie.iso -scan-tracks
+```
+
+Disable UMD subtitles if desired:
+
+```sh
+umd2mkv -iso /path/to/movie.iso -out movie.mkv -subs=false
+```
+
 ## Audio language labels
 
-UMD Video discs can contain multiple language tracks. UMD2MKV looks for the `.CLP` file matching the selected `.MPS` (for example `STREAM/00001.MPS` -> `CLIPINF/00001.CLP`) and scans it for recognized ISO-639 language codes.
+UMD Video discs can contain multiple language tracks. UMD2MKV looks for the `.CLP` file matching the selected `.MPS` (for example `STREAM/00001.MPS` -> `CLIPINF/00001.CLP`) and parses its PSP private-stream descriptors directly. Audio descriptors identify both the PSP audio substream ID and a two-letter ISO-639 language code.
 
-When codes are found, they are assigned to reconstructed audio tracks in on-disc order. For example, three detected codes `eng`, `fre`, `spa` applied to PSP audio substreams `00`, `01`, `02` become MKV tracks tagged as English, French, and Spanish.
+For the tested retail layout, `BD 00 ... en`, `BD 01 ... fr`, and `BD 02 ... es` map directly to audio substreams `00`, `01`, and `02`. The converter writes standard Matroska language tags (`eng`, `fra`, `spa`) plus readable track titles (`English`, `French`, `Spanish`). The mapping is by **stream ID**, not just by order.
 
-This is **best-effort** because the complete commercial UMD Video CLP binary format is not publicly documented. The converter logs the detected order before FFmpeg runs. If no recognized codes are found, tracks are left unlabeled rather than guessing.
+Unknown or unsupported descriptors are left unlabeled rather than guessed. The converter logs each mapping before FFmpeg runs.
 
 ## How conversion works
 
@@ -77,8 +96,9 @@ This is **best-effort** because the complete commercial UMD Video CLP binary for
 5. Parse the MPEG program stream and collect genuine PSP `private_stream_1` audio substreams.
 6. Rebuild PSP `0F D0` ATRAC3+ sound frames into Sony EA3/OMA streams.
 7. Run FFmpeg with H.264 video stream-copy and either AAC-LC 256 kbps (default) or FLAC audio.
-8. Write Matroska language/title metadata for audio tracks when CLP language codes were detected.
-9. Write the final MKV.
+8. Extract PSP `0x80`-`0x9F` private subtitle streams, reassemble PNG data across continuation PES packets, preserve PTS/duration/position, and convert the original artwork to PGS `.sup` tracks.
+9. Write Matroska language/title metadata for audio and subtitle tracks when CLP language codes were detected.
+10. Write the final MKV.
 
 ## Building locally
 
@@ -110,8 +130,8 @@ Open **Actions -> build** in GitHub after pushing the repo, or use **Run workflo
 ## Current limitations
 
 - The cross-platform build is CLI-first; the Win32 GUI is Windows-only.
-- Audio-language mapping is best-effort and depends on recognizable codes in the matching CLP file.
-- UMD subtitle streams are not fully decoded yet; separate recognizable subtitle files are only attempted by the Windows GUI.
+- Audio-language mapping supports the retail CLP descriptor layout tested so far; unusual CLP variants may remain unlabeled.
+- UMD subtitle support is based on the retail PSP PNG/private-stream layout tested so far; unusual discs may use a variant that is not recognized.
 - The main feature is selected by largest `.MPS` size, which can theoretically select a long bonus feature on an unusual disc.
 
 ## Legal

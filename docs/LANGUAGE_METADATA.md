@@ -1,24 +1,39 @@
 # UMD Video language metadata notes
 
-UMD Video supports multiple audio languages and stores per-clip metadata in `.CLP` files under `UMD_VIDEO/CLIPINF`.
-
-UMD2MKV pairs the selected movie with the matching clip-info file by basename, for example:
+UMD Video stores per-clip stream metadata in `.CLP` files under `UMD_VIDEO/CLIPINF`. UMD2MKV pairs the selected movie with the matching clip-info file by basename, for example:
 
 ```text
 UMD_VIDEO/STREAM/00001.MPS
 UMD_VIDEO/CLIPINF/00001.CLP
 ```
 
-The public binary layout of commercial UMD Video CLP files is incomplete, so the implementation uses a conservative heuristic:
+## Tested retail descriptor layout
 
-1. scan the matching CLP for recognized three-letter ISO-639 codes;
-2. de-duplicate equivalent codes such as `fra`/`fre`;
-3. retain their first-occurrence order;
-4. assign those codes to PSP audio streams in substream order (`00`, `01`, `02`, ...);
-5. write both Matroska `language` metadata and a human-readable track title.
+In the supplied retail `00001.CLP`, audio descriptors are 14-byte records beginning with MPEG `private_stream_1` (`0xBD`):
 
-For a disc whose CLP yields `eng`, `fre`, `spa` and whose MPS contains audio streams `00`, `01`, `02`, the resulting tracks are tagged English, French, and Spanish respectively.
+```text
+BD <substream> 00 00 00 08 F0 00 <lang-2> ...
+```
 
-If no language codes can be recognized, the tracks remain unlabeled. If the number of detected language codes differs from the number of reconstructed audio streams, UMD2MKV logs the mismatch and only labels tracks for which it has an ordered candidate.
+The sample contains:
 
-This logic is intentionally easy to inspect in the conversion log so mappings can be corrected if a commercial disc uses a different CLP layout.
+```text
+BD 00 ... en   -> audio substream 00 -> English -> eng
+BD 01 ... fr   -> audio substream 01 -> French  -> fra
+BD 02 ... es   -> audio substream 02 -> Spanish -> spa
+```
+
+Entries with substream IDs `0x80` and above are not treated as audio by the current parser. The sample also contains such descriptors with language codes; these are likely other private streams such as subtitle-related data and are reserved for future work.
+
+## MKV tagging
+
+The converter matches the reconstructed OMA track's PSP substream ID (`00`, `01`, `02`, ...) to the CLP descriptor with the same ID. It then writes both:
+
+```text
+language=eng
+title=English
+```
+
+and equivalent metadata for the other languages. This stream-ID mapping is more reliable than the earlier heuristic that merely scanned for three-letter language strings.
+
+If a CLP uses an unknown descriptor layout or an unsupported language code, that track is left unlabeled rather than guessed.
