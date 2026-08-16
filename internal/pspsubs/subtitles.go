@@ -230,11 +230,14 @@ func collectPrivateSubtitleStreams(mpsPath, outDir string, logf func(string)) (m
 							// Preserving these two bytes is required for PNGs that cross a
 							// PES boundary; dropping them corrupts the IDAT/IEND stream.
 							if !hasPTS {
-								w, we := so.f.Write(privateHdr[2:4])
-								if we != nil {
-									return nil, we
+								// Only append header bytes if they contain non-zero payload data
+								if privateHdr[2] != 0x00 || privateHdr[3] != 0x00 {
+									w, we := so.f.Write(privateHdr[2:4])
+									if we != nil {
+										return nil, we
+									}
+									written += w
 								}
-								written += w
 							}
 							w, we := so.f.Write(data)
 							if we != nil {
@@ -549,12 +552,21 @@ func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)
 		if er != nil {
 			return nil, er
 		}
-		ok := true
+		validFrames := 0
 		for i, r := range recs {
 			if er = writeDisplaySet(wf, r, uint16(i*2), 720, 480); er != nil {
-				ok = false
-				break
+				if logf != nil {
+					logf(fmt.Sprintf("Warning: subtitle stream %02X frame %d skipped (%v)", so.id, i, er))
+				}
+				continue
 			}
+			validFrames++
+		}
+
+		if validFrames == 0 {
+			wf.Close()
+			os.Remove(out)
+			return nil, fmt.Errorf("subtitle stream %02X: no valid PNG records could be rendered", so.id)
 		}
 		ce := wf.Close()
 		if er == nil {
