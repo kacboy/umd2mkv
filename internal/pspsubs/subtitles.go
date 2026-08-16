@@ -46,6 +46,7 @@ type record struct {
 	duration int64
 	x, y     int
 	pngData  []byte
+	header   [18]byte
 }
 
 func decodePTS(h []byte) (int64, bool) {
@@ -347,7 +348,16 @@ func extractRecords(so *rawStream) ([]record, error) {
 		x := int(binary.BigEndian.Uint16(data[start+12 : start+14]))
 		y := int(binary.BigEndian.Uint16(data[start+14 : start+16]))
 		p := append([]byte(nil), data[pngPos:start+total]...)
-		out = append(out, record{startPTS: m.pts, duration: dur, x: x, y: y, pngData: p})
+		var header [18]byte
+		copy(header[:], data[start:start+18])
+		out = append(out, record{
+			startPTS: m.pts,
+			duration: dur,
+			x:         x,
+			y:         y,
+			pngData:   p,
+			header:    header,
+		})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].startPTS < out[j].startPTS })
 	return out, nil
@@ -571,27 +581,17 @@ func writeDisplaySet(w io.Writer, rec record, comp uint16, videoW, videoH int) e
 // BuildPGS extracts all UMD subtitle private streams and converts their original
 // PNG artwork/timing into standard HDMV PGS .sup tracks suitable for Matroska.
 func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)) ([]Track, error) {
-	videoBasePTS, err := findFirstVideoPTS(mpsPath)
-	if err != nil {
-		return nil, fmt.Errorf("find video time origin: %w", err)
-	}
-
-	if logf != nil {
-		logf(fmt.Sprintf(
-			"Video PTS origin: %d (%.3f sec)",
-			videoBasePTS,
-			float64(videoBasePTS)/90000.0,
-		))
-	}
 	streams, err := collectPrivateSubtitleStreams(mpsPath, outDir, logf)
 	if err != nil {
 		return nil, err
 	}
+
 	ids := make([]int, 0, len(streams))
 	for id := range streams {
 		ids = append(ids, int(id))
 	}
 	sort.Ints(ids)
+
 	tracks := make([]Track, 0, len(ids))
 	for _, ii := range ids {
 		so := streams[byte(ii)]
@@ -599,36 +599,34 @@ func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)
 		if er != nil {
 			return nil, er
 		}
-
 		if len(recs) == 0 {
 			continue
 		}
 
+		// Diagnostic dump: preserve the original subtitle PES timestamps and
+		// show the complete PSP 0088 record header for the first few events.
 		if logf != nil {
-			logf(fmt.Sprintf(
-				"Subtitle %02X raw first PTS: %d (%.3f sec), video base: %d (%.3f sec)",
-				so.id,
-				recs[0].startPTS,
-				float64(recs[0].startPTS)/90000.0,
-				videoBasePTS,
-				float64(videoBasePTS)/90000.0,
-			))
-		}
-
-		for i := range recs {
-			recs[i].startPTS -= videoBasePTS
-			if recs[i].startPTS < 0 {
-				recs[i].startPTS = 0
+			limit := len(recs)
+			if limit > 8 {
+				limit = 8
+			}
+			for i := 0; i < limit; i++ {
+				r := recs[i]
+				logf(fmt.Sprintf(
+					"Subtitle %02X record %d: PES_PTS=%d (%.3f sec) durationRaw=%d (%.3f sec @90k) x=%d y=%d header=% X",
+					so.id,
+					i,
+					r.startPTS,
+					float64(r.startPTS)/90000.0,
+					r.duration,
+					float64(r.duration)/90000.0,
+					r.x,
+					r.y,
+					r.header[:],
+				))
 			}
 		}
 
-		if logf != nil {
-			logf(fmt.Sprintf(
-				"Subtitle %02X corrected first event: %.3f sec",
-				so.id,
-				float64(recs[0].startPTS)/90000.0,
-			))
-		}
 		lang := langs[so.id]
 		suffix := lang.Code
 		if suffix == "" {
@@ -654,7 +652,6 @@ func BuildPGS(mpsPath, outDir string, langs map[byte]Language, logf func(string)
 		if ce := wf.Close(); ce != nil {
 			return nil, fmt.Errorf("subtitle stream %02X: %w", so.id, ce)
 		}
-
 		if validFrames == 0 {
 			os.Remove(out)
 			return nil, fmt.Errorf("subtitle stream %02X: no valid PNG records could be rendered", so.id)
