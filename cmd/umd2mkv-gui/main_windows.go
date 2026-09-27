@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -78,6 +79,8 @@ const (
 	idAAC        = 112
 	idFLAC       = 113
 	idScanTracks = 114
+	idTVMode     = 115
+	idAllStreams = 116
 )
 
 var (
@@ -168,10 +171,12 @@ type IsoEntry struct {
 type ScanResult struct {
 	Movie    IsoEntry
 	ClipInfo *IsoEntry
+	Streams  []IsoEntry
+	Clips    []IsoEntry
 	Subs     []IsoEntry
 }
 
-var hwndMain, hISO, hOut, hSelection, hLog, hConvert, hSubs, hAAC, hFLAC, hFFStatus, hScanTracks syscall.Handle
+var hwndMain, hISO, hOut, hSelection, hLog, hConvert, hSubs, hAAC, hFLAC, hTVMode, hAllStreams, hFFStatus, hScanTracks syscall.Handle
 var converting atomic.Bool
 var uiQueue = make(chan func(), 256)
 
@@ -246,6 +251,8 @@ func enableControls(v bool) {
 		n = 1
 	}
 	pEnableWindow.Call(uintptr(hConvert), n)
+	pEnableWindow.Call(uintptr(hTVMode), n)
+	pEnableWindow.Call(uintptr(hAllStreams), n)
 }
 
 func animateConvertButton() {
@@ -333,6 +340,22 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 			}
 		case idFFRecheck:
 			updateFFmpegStatus(true)
+		case idTVMode:
+			tvRaw, _, _ := pSendMessageW.Call(uintptr(hTVMode), BM_GETCHECK, 0, 0)
+			if tvRaw == BST_CHECKED {
+				pSendMessageW.Call(uintptr(hAllStreams), BM_SETCHECK, 0, 0)
+			}
+			if p := strings.TrimSpace(getText(hISO)); p != "" && !converting.Load() {
+				doScan(p)
+			}
+		case idAllStreams:
+			allRaw, _, _ := pSendMessageW.Call(uintptr(hAllStreams), BM_GETCHECK, 0, 0)
+			if allRaw == BST_CHECKED {
+				pSendMessageW.Call(uintptr(hTVMode), BM_SETCHECK, 0, 0)
+			}
+			if p := strings.TrimSpace(getText(hISO)); p != "" && !converting.Load() {
+				doScan(p)
+			}
 		case idConvert:
 			if converting.CompareAndSwap(false, true) {
 				isoPath := strings.TrimSpace(getText(hISO))
@@ -341,6 +364,10 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 				includeSubs := includeSubsRaw == BST_CHECKED
 				flacRaw, _, _ := pSendMessageW.Call(uintptr(hFLAC), BM_GETCHECK, 0, 0)
 				useFLAC := flacRaw == BST_CHECKED
+				tvRaw, _, _ := pSendMessageW.Call(uintptr(hTVMode), BM_GETCHECK, 0, 0)
+				tvMode := tvRaw == BST_CHECKED
+				allRaw, _, _ := pSendMessageW.Call(uintptr(hAllStreams), BM_GETCHECK, 0, 0)
+				allStreams := allRaw == BST_CHECKED
 				if isoPath == "" || out == "" {
 					converting.Store(false)
 					message("Choose an ISO and output MKV first.", MB_OK|MB_ICONERROR)
@@ -356,7 +383,7 @@ func wndProc(hwnd syscall.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 				setText(hConvert, "Converting |")
 				appendLog("Starting conversion worker...")
 				go animateConvertButton()
-				go doConvert(isoPath, out, ffmpeg, includeSubs, useFLAC)
+				go doConvert(isoPath, out, ffmpeg, includeSubs, useFLAC, tvMode, allStreams)
 			}
 		}
 		return 0
@@ -508,21 +535,45 @@ func scanISO(filename string) (ScanResult, error) {
 	if len(movies) == 0 {
 		return ScanResult{}, fmt.Errorf("no .MPS movie stream found under UMD_VIDEO/STREAM")
 	}
-	sort.Slice(movies, func(i, j int) bool { return movies[i].Size > movies[j].Size })
+	// Stream names normally reflect authored playback order (00001, 00002,
+	// ...), which is the most useful order for TV episode output.
+	sort.Slice(movies, func(i, j int) bool { return strings.ToLower(movies[i].Path) < strings.ToLower(movies[j].Path) })
 	sort.Slice(subs, func(i, j int) bool { return subs[i].Size > subs[j].Size })
 	movie := movies[0]
+	for _, candidate := range movies[1:] {
+		if candidate.Size > movie.Size {
+			movie = candidate
+		}
+	}
+	var clips []IsoEntry
+	for _, e := range entries {
+		up := strings.ToUpper(strings.ReplaceAll(e.Path, "\\", "/"))
+		if strings.Contains(up, "/UMD_VIDEO/CLIPINF/") && strings.EqualFold(filepath.Ext(e.Name), ".CLP") {
+			clips = append(clips, e)
+		}
+	}
 	stem := strings.TrimSuffix(movie.Name, filepath.Ext(movie.Name))
 	var clip *IsoEntry
-	for i := range entries {
-		e := entries[i]
-		up := strings.ToUpper(strings.ReplaceAll(e.Path, "\\", "/"))
-		if strings.Contains(up, "/UMD_VIDEO/CLIPINF/") && strings.EqualFold(filepath.Ext(e.Name), ".CLP") && strings.EqualFold(strings.TrimSuffix(e.Name, filepath.Ext(e.Name)), stem) {
+	for i := range clips {
+		e := clips[i]
+		if strings.EqualFold(strings.TrimSuffix(e.Name, filepath.Ext(e.Name)), stem) {
 			x := e
 			clip = &x
 			break
 		}
 	}
-	return ScanResult{Movie: movie, ClipInfo: clip, Subs: subs}, nil
+	return ScanResult{Movie: movie, ClipInfo: clip, Streams: movies, Clips: clips, Subs: subs}, nil
+}
+
+func clipForStream(r ScanResult, stream IsoEntry) *IsoEntry {
+	stem := strings.TrimSuffix(stream.Name, filepath.Ext(stream.Name))
+	for i := range r.Clips {
+		if strings.EqualFold(strings.TrimSuffix(r.Clips[i].Name, filepath.Ext(r.Clips[i].Name)), stem) {
+			clip := r.Clips[i]
+			return &clip
+		}
+	}
+	return nil
 }
 
 func extractEntry(isoPath string, e IsoEntry, out string) error {
@@ -582,6 +633,35 @@ func findFFmpeg() string {
 		return p
 	}
 	return ""
+}
+
+func findFFprobe(ffmpeg string) string {
+	if ffmpeg != "" {
+		for _, name := range []string{"ffprobe.exe", "ffprobe"} {
+			p := filepath.Join(filepath.Dir(ffmpeg), name)
+			if st, err := os.Stat(p); err == nil && !st.IsDir() {
+				return p
+			}
+		}
+	}
+	for _, name := range []string{"ffprobe.exe", "ffprobe"} {
+		if p, err := exec.LookPath(name); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+func probeDuration(ffprobe, mediaPath string) (float64, error) {
+	text, err := runFFmpeg([]string{ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", mediaPath})
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe could not read duration: %w (%s)", err, strings.TrimSpace(text))
+	}
+	duration, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+	if err != nil {
+		return 0, fmt.Errorf("ffprobe returned an invalid duration %q", strings.TrimSpace(text))
+	}
+	return duration, nil
 }
 
 func runFFmpeg(args []string) (string, error) {
@@ -1067,6 +1147,20 @@ func doScan(path string) {
 	if len(subParts) > 0 {
 		subText = strings.Join(subParts, ", ")
 	}
+	tvRaw, _, _ := pSendMessageW.Call(uintptr(hTVMode), BM_GETCHECK, 0, 0)
+	if tvRaw == BST_CHECKED {
+		s := fmt.Sprintf("TV mode: %d MPS streams found; conversion keeps streams 3:00 or longer\r\nOutput: separate files named ... - E01.mkv, E02.mkv, etc.\r\nEpisode durations are verified with FFprobe during conversion.", len(r.Streams))
+		setText(hSelection, s)
+		appendLog(fmt.Sprintf("TV mode found %d MPS streams. Duration probing will exclude menus and clips shorter than 3:00.", len(r.Streams)))
+		return
+	}
+	allRaw, _, _ := pSendMessageW.Call(uintptr(hAllStreams), BM_GETCHECK, 0, 0)
+	if allRaw == BST_CHECKED {
+		s := fmt.Sprintf("All-stream mode: all %d MPS streams will be converted\r\nNo duration filter: menus, intros, transitions, and short extras are preserved.\r\nOutput filenames retain each original stream ID.", len(r.Streams))
+		setText(hSelection, s)
+		appendLog(fmt.Sprintf("All-stream mode found %d MPS streams. Every stream will be converted without duration filtering.", len(r.Streams)))
+		return
+	}
 	s := fmt.Sprintf("Movie stream: %s - %s\r\nAudio tracks (CLP): %s\r\nUMD subtitle tracks (CLP): %s", r.Movie.Path, humanSize(r.Movie.Size), langText, subText)
 	setText(hSelection, s)
 	appendLog("Selected movie stream: " + r.Movie.Path)
@@ -1478,41 +1572,40 @@ func doAnalyzeTracks(isoPath string) {
 	postMessage("Track scan complete. See the log for detected audio/subtitle tracks and subtitle image counts.", MB_OK|MB_ICONINFORMATION)
 }
 
-func doConvert(isoPath, out, ffmpeg string, includeSubs, useFLAC bool) {
-	defer func() {
-		converting.Store(false)
-		postUI(func() { setText(hConvert, "Convert to MKV"); enableControls(true) })
-	}()
+func episodeOutputPath(out string, episode int) string {
+	ext := filepath.Ext(out)
+	if ext == "" {
+		ext = ".mkv"
+	}
+	stem := strings.TrimSuffix(out, filepath.Ext(out))
+	return fmt.Sprintf("%s - E%02d%s", stem, episode, ext)
+}
 
-	postLog("Stage 1/5: scanning ISO...")
-	r, err := scanISO(isoPath)
-	if err != nil {
-		postLog("ERROR: " + err.Error())
-		postMessage(err.Error(), MB_OK|MB_ICONERROR)
-		return
+func streamOutputPath(out string, stream IsoEntry, index int) string {
+	ext := filepath.Ext(out)
+	if ext == "" {
+		ext = ".mkv"
 	}
-	tmp, err := os.MkdirTemp("", "umd2mkv-")
-	if err != nil {
-		postMessage(err.Error(), MB_OK|MB_ICONERROR)
-		return
+	base := strings.TrimSuffix(out, filepath.Ext(out))
+	streamID := strings.TrimSpace(strings.TrimSuffix(stream.Name, filepath.Ext(stream.Name)))
+	if streamID == "" {
+		streamID = fmt.Sprintf("Stream %02d", index)
 	}
-	defer os.RemoveAll(tmp)
-	movie := filepath.Join(tmp, "movie.mps")
-	postLog("Stage 2/5: extracting movie stream: " + r.Movie.Path)
-	if err = extractEntryProgress(isoPath, r.Movie, movie, func(pct int) { postLog(fmt.Sprintf("Movie extraction: %d%%", pct)) }); err != nil {
-		postLog("EXTRACTION ERROR: " + err.Error())
-		postMessage(err.Error(), MB_OK|MB_ICONERROR)
-		return
-	}
+	return fmt.Sprintf("%s - %s%s", base, streamID, ext)
+}
 
-	postLog("Stage 3/5: rebuilding PSP ATRAC3+ audio tracks...")
+func formatDuration(seconds float64) string {
+	total := int(seconds + 0.5)
+	return fmt.Sprintf("%d:%02d", total/60, total%60)
+}
+
+func muxStream(isoPath, movie, tmp, out, ffmpeg string, clip *IsoEntry, includeSubs, useFLAC bool) error {
+	postLog("Rebuilding PSP ATRAC3+ audio tracks...")
 	audioFiles, audioErr := demuxAtracFromMPS(movie, tmp)
 	if audioErr != nil {
-		postLog("AUDIO DEMUX ERROR: " + audioErr.Error())
-		postMessage("The movie video was found, but PSP audio demux failed. See the log in the app.", MB_OK|MB_ICONERROR)
-		return
+		return fmt.Errorf("audio demux failed: %w", audioErr)
 	}
-	langs := detectCLPLanguages(isoPath, r.ClipInfo)
+	langs := detectCLPLanguages(isoPath, clip)
 	for _, a := range audioFiles {
 		if st, e := os.Stat(a); e == nil {
 			postLog(fmt.Sprintf("Extracted audio: %s (%d bytes)", filepath.Base(a), st.Size()))
@@ -1524,16 +1617,14 @@ func doConvert(isoPath, out, ffmpeg string, includeSubs, useFLAC bool) {
 
 	var subTracks []pspsubs.Track
 	if includeSubs {
-		postLog("Stage 4/5: converting original UMD PNG subtitles to selectable PGS tracks...")
-		priv := detectCLPPrivateLanguages(isoPath, r.ClipInfo)
+		postLog("Converting original UMD PNG subtitles to selectable PGS tracks...")
+		priv := detectCLPPrivateLanguages(isoPath, clip)
 		var subErr error
 		subTracks, subErr = pspsubs.BuildPGS(movie, tmp, subtitleLanguageMap(priv), postLog)
 		if subErr != nil {
 			postLog("Subtitle extraction skipped: " + subErr.Error())
 			subTracks = nil
 		}
-	} else {
-		postLog("Stage 4/5: UMD subtitles disabled.")
 	}
 
 	base := []string{ffmpeg, "-y", "-hide_banner", "-loglevel", "warning", "-i", movie}
@@ -1550,7 +1641,7 @@ func doConvert(isoPath, out, ffmpeg string, includeSubs, useFLAC bool) {
 	for i := range subTracks {
 		maps = append(maps, "-map", fmt.Sprintf("%d:s:0", 1+len(audioFiles)+i))
 	}
-	postLog(fmt.Sprintf("Stage 5/5: muxing video, %d audio track(s), and %d subtitle track(s)...", len(audioFiles), len(subTracks)))
+	postLog(fmt.Sprintf("Muxing video, %d audio track(s), and %d subtitle track(s)...", len(audioFiles), len(subTracks)))
 	args := append(append([]string{}, base...), maps...)
 	for i, audioFile := range audioFiles {
 		if lang, ok := languageForAudioFile(audioFile, langs); ok {
@@ -1578,9 +1669,9 @@ func doConvert(isoPath, out, ffmpeg string, includeSubs, useFLAC bool) {
 		args = append(args, "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "256k")
 	}
 	args = append(args, "-c:s", "copy", out)
-	logText, er := runFFmpeg(args)
-	if er != nil && len(subTracks) > 0 {
-		postLog("PGS subtitle mux failed; retrying video/audio without subtitles so the movie conversion is not lost.")
+	logText, err := runFFmpeg(args)
+	if err != nil && len(subTracks) > 0 {
+		postLog("PGS subtitle mux failed; retrying video/audio without subtitles.")
 		base2 := []string{ffmpeg, "-y", "-hide_banner", "-loglevel", "warning", "-i", movie}
 		for _, a := range audioFiles {
 			base2 = append(base2, "-i", a)
@@ -1602,15 +1693,131 @@ func doConvert(isoPath, out, ffmpeg string, includeSubs, useFLAC bool) {
 			args = append(args, "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "256k")
 		}
 		args = append(args, out)
-		logText, er = runFFmpeg(args)
+		logText, err = runFFmpeg(args)
 	}
-	if er != nil {
-		postLog("FFmpeg error:\r\n" + logText)
-		postMessage("FFmpeg conversion failed. See the log in the app.", MB_OK|MB_ICONERROR)
+	if err != nil {
+		return fmt.Errorf("FFmpeg conversion failed: %w\n%s", err, logText)
+	}
+	return nil
+}
+
+func doConvert(isoPath, out, ffmpeg string, includeSubs, useFLAC, tvMode, allStreams bool) {
+	defer func() {
+		converting.Store(false)
+		postUI(func() { setText(hConvert, "Convert to MKV"); enableControls(true) })
+	}()
+
+	postLog("Scanning ISO...")
+	r, err := scanISO(isoPath)
+	if err != nil {
+		postLog("ERROR: " + err.Error())
+		postMessage(err.Error(), MB_OK|MB_ICONERROR)
 		return
 	}
-	postLog("Done: " + out)
-	postMessage("MKV created:\r\n"+out, MB_OK|MB_ICONINFORMATION)
+	tmp, err := os.MkdirTemp("", "umd2mkv-")
+	if err != nil {
+		postMessage(err.Error(), MB_OK|MB_ICONERROR)
+		return
+	}
+	defer os.RemoveAll(tmp)
+	streams := []IsoEntry{r.Movie}
+	batchMode := tvMode || allStreams
+	ffprobe := ""
+	if batchMode {
+		streams = r.Streams
+	}
+	if tvMode {
+		ffprobe = findFFprobe(ffmpeg)
+		if ffprobe == "" {
+			postLog("ERROR: TV mode requires ffprobe.exe beside ffmpeg.exe or on PATH.")
+			postMessage("TV mode needs ffprobe.exe to identify episode-length streams. Put it beside ffmpeg.exe or add it to PATH.", MB_OK|MB_ICONERROR)
+			return
+		}
+		postLog(fmt.Sprintf("TV mode: checking %d streams; streams shorter than 3:00 are skipped.", len(streams)))
+	} else if allStreams {
+		postLog(fmt.Sprintf("All-stream mode: converting all %d streams without a duration filter.", len(streams)))
+	}
+
+	episode, skipped, failed, succeeded := 0, 0, 0, 0
+	for index, stream := range streams {
+		streamTmp, tempErr := os.MkdirTemp(tmp, "stream-")
+		if tempErr != nil {
+			postLog("ERROR: " + tempErr.Error())
+			failed++
+			continue
+		}
+		movie := filepath.Join(streamTmp, "movie.mps")
+		postLog(fmt.Sprintf("Stream %d/%d: extracting %s (%s)", index+1, len(streams), stream.Path, humanSize(stream.Size)))
+		err = extractEntryProgress(isoPath, stream, movie, func(pct int) { postLog(fmt.Sprintf("Extraction: %d%%", pct)) })
+		if err != nil {
+			postLog("EXTRACTION ERROR: " + err.Error())
+			os.RemoveAll(streamTmp)
+			failed++
+			if !batchMode {
+				postMessage(err.Error(), MB_OK|MB_ICONERROR)
+				return
+			}
+			continue
+		}
+
+		if tvMode {
+			duration, probeErr := probeDuration(ffprobe, movie)
+			if probeErr != nil {
+				postLog("DURATION ERROR: " + probeErr.Error())
+				os.RemoveAll(streamTmp)
+				failed++
+				continue
+			}
+			postLog(fmt.Sprintf("Duration: %s", formatDuration(duration)))
+			if duration < 180 {
+				postLog("Skipped short menu/clip (under 3:00): " + stream.Path)
+				os.RemoveAll(streamTmp)
+				skipped++
+				continue
+			}
+		}
+
+		episode++
+		streamOut := out
+		if tvMode {
+			streamOut = episodeOutputPath(out, episode)
+			postLog(fmt.Sprintf("Episode %02d -> %s", episode, streamOut))
+		} else if allStreams {
+			streamOut = streamOutputPath(out, stream, index+1)
+			postLog(fmt.Sprintf("Stream %s -> %s", stream.Name, streamOut))
+		}
+		err = muxStream(isoPath, movie, streamTmp, streamOut, ffmpeg, clipForStream(r, stream), includeSubs, useFLAC)
+		os.RemoveAll(streamTmp)
+		if err != nil {
+			postLog("CONVERSION ERROR: " + err.Error())
+			failed++
+			if !batchMode {
+				postMessage("FFmpeg conversion failed. See the log in the app.", MB_OK|MB_ICONERROR)
+				return
+			}
+			continue
+		}
+		postLog("Done: " + streamOut)
+		succeeded++
+	}
+
+	if !batchMode {
+		postMessage("MKV created:\r\n"+out, MB_OK|MB_ICONINFORMATION)
+		return
+	}
+	if succeeded == 0 {
+		postMessage("No MKVs were created. See the log for extraction or conversion errors.", MB_OK|MB_ICONERROR)
+		return
+	}
+	summary := fmt.Sprintf("All-stream conversion complete: %d MKV(s) created.", succeeded)
+	if tvMode {
+		summary = fmt.Sprintf("TV conversion complete: %d episode MKV(s) created; %d short stream(s) skipped.", succeeded, skipped)
+	}
+	if failed > 0 {
+		summary += fmt.Sprintf(" %d stream(s) failed; see the log.", failed)
+	}
+	postLog(summary)
+	postMessage(summary+"\r\n\r\nOutput folder:\r\n"+filepath.Dir(out), MB_OK|MB_ICONINFORMATION)
 }
 
 func main() {
@@ -1619,7 +1826,7 @@ func main() {
 	className := utf16p("UMD2MKVWindow")
 	wc := WNDCLASSEX{CbSize: uint32(unsafe.Sizeof(WNDCLASSEX{})), LpfnWndProc: syscall.NewCallback(wndProc), HInstance: syscall.Handle(hInst), HbrBackground: syscall.Handle(6), LpszClassName: className}
 	pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
-	r, _, _ := pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(utf16p("UMD Video ISO to MKV"))), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 800, 640, 0, 0, hInst, 0)
+	r, _, _ := pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(utf16p("UMD Video ISO to MKV"))), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 800, 680, 0, 0, hInst, 0)
 	hwndMain = syscall.Handle(r)
 	createControl("STATIC", "PSP UMD Video ISO to MKV", SS_LEFT, 20, 16, 500, 28, hwndMain, 0)
 	createControl("STATIC", "ISO:", SS_LEFT, 20, 58, 80, 22, hwndMain, 0)
@@ -1631,20 +1838,22 @@ func main() {
 	hFFStatus = createControl("STATIC", "FFmpeg: checking...", SS_LEFT, 20, 130, 620, 22, hwndMain, 0)
 	createControl("BUTTON", "Recheck", BS_PUSHBUTTON|WS_TABSTOP, 670, 126, 95, 28, hwndMain, idFFRecheck)
 	hSelection = createControl("EDIT", "Choose an ISO; it will be scanned automatically.", WS_BORDER|ES_MULTILINE|ES_READONLY, 20, 158, 745, 72, hwndMain, idSelection)
-	hSubs = createControl("BUTTON", "Include UMD subtitles (PGS)", BS_AUTOCHECKBOX|WS_TABSTOP, 20, 242, 220, 26, hwndMain, idSubs)
+	hTVMode = createControl("BUTTON", "TV show mode (streams 3 minutes or longer)", BS_AUTOCHECKBOX|WS_TABSTOP, 20, 238, 365, 26, hwndMain, idTVMode)
+	hAllStreams = createControl("BUTTON", "Convert all streams (include short content)", BS_AUTOCHECKBOX|WS_TABSTOP, 400, 238, 350, 26, hwndMain, idAllStreams)
+	hSubs = createControl("BUTTON", "Include UMD subtitles (PGS)", BS_AUTOCHECKBOX|WS_TABSTOP, 20, 270, 220, 26, hwndMain, idSubs)
 	pSendMessageW.Call(uintptr(hSubs), BM_SETCHECK, BST_CHECKED, 0)
-	createControl("STATIC", "Audio:", SS_LEFT, 260, 242, 55, 22, hwndMain, 0)
-	hAAC = createControl("BUTTON", "AAC 256k (recommended)", BS_AUTORADIOBUTTON|WS_GROUP|WS_TABSTOP, 315, 240, 190, 26, hwndMain, idAAC)
-	hFLAC = createControl("BUTTON", "FLAC (lossless)", BS_AUTORADIOBUTTON|WS_TABSTOP, 505, 240, 150, 26, hwndMain, idFLAC)
+	createControl("STATIC", "Audio:", SS_LEFT, 260, 270, 55, 22, hwndMain, 0)
+	hAAC = createControl("BUTTON", "AAC 256k (recommended)", BS_AUTORADIOBUTTON|WS_GROUP|WS_TABSTOP, 315, 268, 190, 26, hwndMain, idAAC)
+	hFLAC = createControl("BUTTON", "FLAC (lossless)", BS_AUTORADIOBUTTON|WS_TABSTOP, 505, 268, 150, 26, hwndMain, idFLAC)
 	pSendMessageW.Call(uintptr(hAAC), BM_SETCHECK, BST_CHECKED, 0)
-	hConvert = createControl("BUTTON", "Convert to MKV", BS_DEFPUSHBUTTON|WS_TABSTOP, 20, 278, 150, 34, hwndMain, idConvert)
-	createControl("STATIC", "Log:", SS_LEFT, 20, 324, 80, 22, hwndMain, 0)
-	hLog = createControl("EDIT", "", WS_BORDER|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY, 20, 346, 745, 210, hwndMain, idLog)
-	createControl("STATIC", "UMD2MKV v1.2.1", SS_LEFT, 20, 568, 220, 22, hwndMain, 0)
-	createControl("STATIC", "@kacboy", SS_RIGHT, 545, 568, 220, 22, hwndMain, 0)
+	hConvert = createControl("BUTTON", "Convert to MKV", BS_DEFPUSHBUTTON|WS_TABSTOP, 20, 306, 150, 34, hwndMain, idConvert)
+	createControl("STATIC", "Log:", SS_LEFT, 20, 352, 80, 22, hwndMain, 0)
+	hLog = createControl("EDIT", "", WS_BORDER|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY, 20, 374, 745, 210, hwndMain, idLog)
+	createControl("STATIC", "UMD2MKV v1.3.0", SS_LEFT, 20, 596, 220, 22, hwndMain, 0)
+	createControl("STATIC", "@kacboy", SS_RIGHT, 545, 596, 220, 22, hwndMain, 0)
 	pShowWindow.Call(uintptr(hwndMain), SW_SHOW)
 	pUpdateWindow.Call(uintptr(hwndMain))
-	appendLog("UMD2MKV v1.2.1 ready. AAC-LC 256k is recommended; FLAC is optional. UMD PNG subtitles can be preserved as selectable PGS tracks.")
+	appendLog("UMD2MKV v1.3.0 ready. TV show mode filters short streams; Convert all streams preserves everything.")
 	updateFFmpegStatus(true)
 	var msg MSG
 	for {
