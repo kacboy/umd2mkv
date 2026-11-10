@@ -4,6 +4,8 @@ UMD2MKV extracts video streams from a PSP UMD Video ISO, reconstructs their PSP 
 
 The H.264 video stream is copied without re-encoding. By default, ATRAC3+ audio is converted to **AAC-LC at 256 kbps per track** for broad playback compatibility and a much smaller file than lossless FLAC. A lossless FLAC mode remains available.
 
+![](/preview130.png)
+
 ## Platforms
 
 - **Windows:** native GUI (`UMD2MKV.exe`) and CLI.
